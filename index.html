@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Inventario & POS Cloud</title>
+    <title>Inventario & POS Cloud Pro</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <meta name="theme-color" content="#2563eb">
     <style>
@@ -17,8 +17,8 @@
 
     <header class="bg-blue-600 text-white shadow-md sticky top-0 z-20">
         <div class="px-4 py-4 flex justify-between items-center">
-            <h1 id="header-title" class="text-xl font-bold tracking-tight">Cargando...</h1>
-            <span id="header-badge" class="bg-blue-800 text-sm font-semibold px-2 py-1 rounded-full"></span>
+            <h1 id="header-title" class="text-xl font-bold tracking-tight">Inicializando...</h1>
+            <span id="header-badge" class="bg-blue-800 text-sm font-semibold px-2 py-1 rounded-full">Conectando</span>
         </div>
     </header>
 
@@ -152,10 +152,12 @@
         import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
         import { 
             getFirestore, collection, addDoc, doc, updateDoc, deleteDoc, 
-            onSnapshot, query, orderBy, writeBatch 
+            onSnapshot, query, orderBy, writeBatch, initializeFirestore, persistentLocalCache, persistentMultipleTabManager
         } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 
-        // CONFIGURACIÓN DE FIREBASE (Reemplaza con tus llaves)
+        // ==========================================
+        // REEMPLAZA ESTO CON TUS CREDENCIALES REALES
+        // ==========================================
         const firebaseConfig = {
             apiKey: "TU_API_KEY",
             authDomain: "TU_PROJECT_ID.firebaseapp.com",
@@ -165,9 +167,17 @@
             appId: "TU_APP_ID"
         };
 
-        // Initialize Firebase & Firestore
-        const fbApp = initializeApp(firebaseConfig);
-        const db = getFirestore(fbApp);
+        // Inicialización robusta con catch preventivo
+        let db;
+        try {
+            const fbApp = initializeApp(firebaseConfig);
+            // Habilitar persistencia en caché local inyectada en IndexedDB
+            db = initializeFirestore(fbApp, {
+                localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() })
+            });
+        } catch (initError) {
+            alert("Excepción crítica de inicialización del SDK: " + initError.message);
+        }
 
         class AppManager {
             constructor() {
@@ -178,7 +188,7 @@
                 this.currentBase64Image = null;
 
                 this.initEvents();
-                this.initRealtimeSync();
+                if (db) this.initRealtimeSync();
             }
 
             initEvents() {
@@ -198,19 +208,28 @@
                 });
             }
 
-            // Flujo reactivo continuo desde Firestore
             initRealtimeSync() {
                 const qProducts = query(collection(db, "products"), orderBy("createdAt", "desc"));
-                onSnapshot(qProducts, (snapshot) => {
-                    this.items = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                    this.renderCurrentView();
-                });
+                onSnapshot(qProducts, 
+                    (snapshot) => {
+                        this.items = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                        this.renderCurrentView();
+                    },
+                    (error) => {
+                        alert("Firestore Error (Productos): " + error.code + " - " + error.message);
+                    }
+                );
 
                 const qOrders = query(collection(db, "orders"), orderBy("createdAt", "desc"));
-                onSnapshot(qOrders, (snapshot) => {
-                    this.orders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-                    this.renderCurrentView();
-                });
+                onSnapshot(qOrders, 
+                    (snapshot) => {
+                        this.orders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                        this.renderCurrentView();
+                    },
+                    (error) => {
+                        alert("Firestore Error (Pedidos): " + error.code + " - " + error.message);
+                    }
+                );
             }
 
             compressImage(file) {
@@ -259,10 +278,9 @@
                 if (this.currentTab === 'catalog') this.renderCatalog();
             }
 
-            // --- ESCURITURAS / MUTACIONES EN CLOUD ---
             async addItem() {
                 const btn = document.getElementById('submit-btn');
-                btn.disabled = true; btn.textContent = 'Guardando en la nube...';
+                btn.disabled = true; btn.textContent = 'Sincronizando...';
 
                 try {
                     await addDoc(collection(db, "products"), {
@@ -281,7 +299,7 @@
                     document.getElementById('preview-placeholder').classList.remove('hidden');
                     document.getElementById('name').focus();
                 } catch (e) {
-                    alert("Error de escritura: " + e.message);
+                    alert("Fallo al escribir producto: " + e.message);
                 } finally {
                     btn.disabled = false; btn.textContent = 'Guardar Producto';
                 }
@@ -290,17 +308,18 @@
             async updateStock(id, change) {
                 const item = this.items.find(i => i.id === id);
                 if (item && item.stock + change >= 0) {
-                    await updateDoc(doc(db, "products", id), { stock: item.stock + change });
+                    try {
+                        await updateDoc(doc(db, "products", id), { stock: item.stock + change });
+                    } catch (e) { alert("Error al modificar stock: " + e.message); }
                 }
             }
 
             async deleteItem(id) {
                 if(confirm('¿Eliminar definitivamente este producto?')) {
-                    await deleteDoc(doc(db, "products", id));
+                    try { await deleteDoc(doc(db, "products", id)); } catch(e) { alert("Error al eliminar: " + e.message); }
                 }
             }
 
-            // Transacción atómica por lote para evitar race conditions
             async processCheckout() {
                 if (Object.keys(this.cart).length === 0) return;
 
@@ -317,14 +336,10 @@
                 for (const [id, qty] of Object.entries(this.cart)) {
                     const item = this.items.find(i => i.id === id);
                     if (item) {
-                        const newStock = item.stock - qty;
-                        const newSoldCount = item.soldCount + qty;
-                        
                         batch.update(doc(db, "products", id), { 
-                            stock: newStock, 
-                            soldCount: newSoldCount 
+                            stock: item.stock - qty, 
+                            soldCount: item.soldCount + qty 
                         });
-
                         orderData.items.push({ name: item.name, qty: qty, price: item.price });
                         orderData.total += (item.price * qty);
                     }
@@ -336,13 +351,12 @@
                     await batch.commit();
                     this.cart = {};
                     this.renderPos();
-                    alert(`Venta guardada en la nube: ${this.formatCLP(orderData.total)}`);
+                    alert(`Venta guardada: ${this.formatCLP(orderData.total)}`);
                 } catch (e) {
-                    alert("Error al procesar el lote: " + e.message);
+                    alert("Fallo de transacción en lote: " + e.message);
                 }
             }
 
-            // --- RENDERS MODULARES (ORIENTADOS A MÓVIL) ---
             renderInventory() {
                 const container = document.getElementById('inventory-list');
                 document.getElementById('header-badge').textContent = `${this.items.length} regs`;
@@ -367,7 +381,7 @@
                             </div>
                         </div>
                     </div>
-                `).join('') || '<p class="text-center text-gray-400 py-4">Sin inventario en la nube.</p>';
+                `).join('') || '<p class="text-center text-gray-400 py-4">Inventario vacío en la nube.</p>';
             }
 
             addToCart(id) {
@@ -441,7 +455,7 @@
                         </div>
                         <span class="bg-green-100 text-green-700 text-xs font-bold px-2 py-1 rounded-full whitespace-nowrap">${item.soldCount} u.</span>
                     </div>
-                `).join('') || '<p class="text-sm text-gray-400 p-3 text-center">Sin métricas disponibles.</p>';
+                `).join('') || '<p class="text-sm text-gray-400 p-3 text-center">Sin métricas.</p>';
 
                 document.getElementById('orders-list').innerHTML = this.orders.map(order => `
                     <div class="bg-white rounded-xl shadow-sm border border-gray-100 p-3">
@@ -453,7 +467,7 @@
                             ${order.items.map(i => `<li class="py-1 flex justify-between"><span>${i.qty}x ${i.name}</span> <span class="text-gray-400">${this.formatCLP(i.price * i.qty)}</span></li>`).join('')}
                         </ul>
                     </div>
-                `).join('') || '<p class="text-center text-gray-400 py-4">Sin pedidos registrados.</p>';
+                `).join('') || '<p class="text-center text-gray-400 py-4">Sin pedidos.</p>';
             }
 
             generateCatalogText() {
@@ -479,7 +493,7 @@
                 const text = this.generateCatalogText();
                 if (navigator.share) {
                     try { await navigator.share({ title: 'Catálogo', text: text }); } catch (err) { console.log(err); }
-                } else { alert('Fallback: Copia el texto o usa WhatsApp directo.'); }
+                } else { alert('Usa WhatsApp directo.'); }
             }
 
             renderCatalog() {
@@ -498,7 +512,6 @@
             }
         }
 
-        // Exportar a scope global para los onclick inline heredados del markup
         window.app = new AppManager();
         window.app.switchTab('inventory');
     </script>
